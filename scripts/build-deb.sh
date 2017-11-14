@@ -18,7 +18,8 @@ trap cleanup EXIT
 
 . scripts/git-tag.sh
 
-git archive HEAD --prefix=bcc/ --format=tar.gz -o $TMP/bcc_$revision.orig.tar.gz
+git archive HEAD --prefix=bcc/ --format=tar \
+  | gzip > $TMP/bcc_$revision.orig.tar.gz
 
 pushd $TMP
 tar xf bcc_$revision.orig.tar.gz

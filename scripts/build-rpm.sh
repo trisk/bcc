@@ -16,7 +16,8 @@ llvmver=3.7.1
 
 . scripts/git-tag.sh
 
-git archive HEAD --prefix=bcc/ --format=tar.gz -o $TMP/SOURCES/bcc.tar.gz
+git archive HEAD --prefix=bcc/ --format=tar \
+  | gzip > $TMP/SOURCES/bcc.tar.gz
 
 sed \
   -e "s/^\(Version:\s*\)@REVISION@/\1$revision/" \

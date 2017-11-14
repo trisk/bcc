@@ -16,7 +16,8 @@ llvmver=3.7.1
 
 . scripts/git-tag.sh
 
-git archive HEAD --prefix=bcc/ --format=tar.gz -o $TMP/SOURCES/$git_tag_latest.tar.gz
+git archive HEAD --prefix=bcc/ --format=tar \
+  | gzip > $TMP/SOURCES/$git_tag_latest.tar.gz
 wget -P $TMP/SOURCES http://llvm.org/releases/$llvmver/{cfe,llvm}-$llvmver.src.tar.xz
 
 sed \

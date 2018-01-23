@@ -160,58 +160,47 @@ class TableBase(MutableMapping):
         self._cbs = {}
 
     def key_sprintf(self, key):
-        key_p = ct.pointer(key)
         buf = ct.create_string_buffer(ct.sizeof(self.Key) * 8)
-        res = lib.bpf_table_key_snprintf(self.bpf.module, self.map_id,
-                buf, len(buf), key_p)
+        res = lib.bpf_table_key_snprintf(self.bpf.module, self.map_id, buf,
+                                         len(buf), ct.byref(key))
         if res < 0:
             raise Exception("Could not printf key")
         return buf.value
 
     def leaf_sprintf(self, leaf):
-        leaf_p = ct.pointer(leaf)
         buf = ct.create_string_buffer(ct.sizeof(self.Leaf) * 8)
-        res = lib.bpf_table_leaf_snprintf(self.bpf.module, self.map_id,
-                buf, len(buf), leaf_p)
+        res = lib.bpf_table_leaf_snprintf(self.bpf.module, self.map_id, buf,
+                                          len(buf), ct.byref(leaf))
         if res < 0:
             raise Exception("Could not printf leaf")
         return buf.value
 
     def key_scanf(self, key_str):
         key = self.Key()
-        key_p = ct.pointer(key)
-        res = lib.bpf_table_key_sscanf(self.bpf.module, self.map_id,
-                key_str, key_p)
+        res = lib.bpf_table_key_sscanf(self.bpf.module, self.map_id, key_str,
+                                       ct.byref(key))
         if res < 0:
             raise Exception("Could not scanf key")
         return key
 
     def leaf_scanf(self, leaf_str):
         leaf = self.Leaf()
-        leaf_p = ct.pointer(leaf)
-        res = lib.bpf_table_leaf_sscanf(self.bpf.module, self.map_id,
-                leaf_str, leaf_p)
+        res = lib.bpf_table_leaf_sscanf(self.bpf.module, self.map_id, leaf_str,
+                                        ct.byref(leaf))
         if res < 0:
             raise Exception("Could not scanf leaf")
         return leaf
 
     def __getitem__(self, key):
-        key_p = ct.pointer(key)
         leaf = self.Leaf()
-        leaf_p = ct.pointer(leaf)
-        res = lib.bpf_lookup_elem(self.map_fd,
-                ct.cast(key_p, ct.c_void_p),
-                ct.cast(leaf_p, ct.c_void_p))
+        res = lib.bpf_lookup_elem(self.map_fd, ct.byref(key), ct.byref(leaf))
         if res < 0:
             raise KeyError
         return leaf
 
     def __setitem__(self, key, leaf):
-        key_p = ct.pointer(key)
-        leaf_p = ct.pointer(leaf)
-        res = lib.bpf_update_elem(self.map_fd,
-                ct.cast(key_p, ct.c_void_p),
-                ct.cast(leaf_p, ct.c_void_p), 0)
+        res = lib.bpf_update_elem(self.map_fd, ct.byref(key), ct.byref(leaf),
+                                  0)
         if res < 0:
             errstr = os.strerror(ct.get_errno())
             raise Exception("Could not update table: %s" % errstr)
@@ -273,26 +262,24 @@ class TableBase(MutableMapping):
 
     def next(self, key):
         next_key = self.Key()
-        next_key_p = ct.pointer(next_key)
 
         if key is None:
-            res = lib.bpf_get_first_key(self.map_fd,
-                    ct.cast(next_key_p, ct.c_void_p),
-                    ct.sizeof(self.Key))
+            res = lib.bpf_get_first_key(self.map_fd, ct.byref(next_key),
+                                        ct.sizeof(self.Key))
         else:
-            key_p = ct.pointer(key)
-            res = lib.bpf_get_next_key(self.map_fd,
-                    ct.cast(key_p, ct.c_void_p),
-                    ct.cast(next_key_p, ct.c_void_p))
+            res = lib.bpf_get_next_key(self.map_fd, ct.byref(key),
+                                       ct.byref(next_key))
 
         if res < 0:
             raise StopIteration()
         return next_key
 
     def print_log2_hist(self, val_type="value", section_header="Bucket ptr",
-            section_print_fn=None, bucket_fn=None, strip_leading_zero=None):
+            section_print_fn=None, bucket_fn=None, strip_leading_zero=None,
+            bucket_sort_fn=None):
         """print_log2_hist(val_type="value", section_header="Bucket ptr",
-                           section_print_fn=None, bucket_fn=None)
+                           section_print_fn=None, bucket_fn=None,
+                           strip_leading_zero=None, bucket_sort_fn=None):
 
         Prints a table as a log2 histogram. The table must be stored as
         log2. The val_type argument is optional, and is a column header.
@@ -302,9 +289,12 @@ class TableBase(MutableMapping):
         to format into a string as it sees fit. If bucket_fn is not None,
         it will be used to produce a bucket value for the histogram keys.
         If the value of strip_leading_zero is not False, prints a histogram
-        that is omitted leading zeros from the beginning. The maximum index
-        allowed is log2_index_max (65), which will accommodate any 64-bit
-        integer in the histogram.
+        that is omitted leading zeros from the beginning.
+        If bucket_sort_fn is not None, it will be used to sort the buckets
+        before iterating them, and it is useful when there are multiple fields
+        in the secondary key.
+        The maximum index allowed is log2_index_max (65), which will
+        accommodate any 64-bit integer in the histogram.
         """
         if isinstance(self.Key(), ct.Structure):
             tmp = {}
@@ -317,7 +307,13 @@ class TableBase(MutableMapping):
                 vals = tmp[bucket] = tmp.get(bucket, [0] * log2_index_max)
                 slot = getattr(k, f2)
                 vals[slot] = v.value
-            for bucket, vals in tmp.items():
+
+            buckets = tmp.keys()
+            if bucket_sort_fn:
+                buckets = bucket_sort_fn(buckets)
+
+            for bucket in buckets:
+                vals = tmp[bucket]
                 if section_print_fn:
                     print("\n%s = %s" % (section_header,
                         section_print_fn(bucket)))
@@ -331,9 +327,10 @@ class TableBase(MutableMapping):
             _print_log2_hist(vals, val_type, strip_leading_zero)
 
     def print_linear_hist(self, val_type="value", section_header="Bucket ptr",
-            section_print_fn=None, bucket_fn=None):
+            section_print_fn=None, bucket_fn=None, bucket_sort_fn=None):
         """print_linear_hist(val_type="value", section_header="Bucket ptr",
-                           section_print_fn=None, bucket_fn=None)
+                           section_print_fn=None, bucket_fn=None,
+                           bucket_sort_fn=None)
 
         Prints a table as a linear histogram. This is intended to span integer
         ranges, eg, from 0 to 100. The val_type argument is optional, and is a
@@ -342,6 +339,9 @@ class TableBase(MutableMapping):
         each.  If section_print_fn is not None, it will be passed the bucket
         value to format into a string as it sees fit. If bucket_fn is not None,
         it will be used to produce a bucket value for the histogram keys.
+        If bucket_sort_fn is not None, it will be used to sort the buckets
+        before iterating them, and it is useful when there are multiple fields
+        in the secondary key.
         The maximum index allowed is linear_index_max (1025), which is hoped
         to be sufficient for integer ranges spanned.
         """
@@ -356,7 +356,13 @@ class TableBase(MutableMapping):
                 vals = tmp[bucket] = tmp.get(bucket, [0] * linear_index_max)
                 slot = getattr(k, f2)
                 vals[slot] = v.value
-            for bucket, vals in tmp.items():
+
+            buckets = tmp.keys()
+            if bucket_sort_fn:
+                buckets = bucket_sort_fn(buckets)
+
+            for bucket in buckets:
+                vals = tmp[bucket]
                 if section_print_fn:
                     print("\n%s = %s" % (section_header,
                         section_print_fn(bucket)))
@@ -386,8 +392,7 @@ class HashTable(TableBase):
         return i
 
     def __delitem__(self, key):
-        key_p = ct.pointer(key)
-        res = lib.bpf_delete_elem(self.map_fd, ct.cast(key_p, ct.c_void_p))
+        res = lib.bpf_delete_elem(self.map_fd, ct.byref(key))
         if res < 0:
             raise KeyError
 
@@ -425,14 +430,11 @@ class ArrayBase(TableBase):
 
     def __delitem__(self, key):
         key = self._normalize_key(key)
-        key_p = ct.pointer(key)
-
         # Deleting from array type maps does not have an effect, so
         # zero out the entry instead.
         leaf = self.Leaf()
-        leaf_p = ct.pointer(leaf)
-        res = lib.bpf_update_elem(self.map_fd, ct.cast(key_p, ct.c_void_p),
-                ct.cast(leaf_p, ct.c_void_p), 0)
+        res = lib.bpf_update_elem(self.map_fd, ct.byref(key), ct.byref(leaf),
+                                  0)
         if res < 0:
             raise Exception("Could not clear item")
 
@@ -473,8 +475,7 @@ class ProgArray(ArrayBase):
 
     def __delitem__(self, key):
         key = self._normalize_key(key)
-        key_p = ct.pointer(key)
-        res = lib.bpf_delete_elem(self.map_fd, ct.cast(key_p, ct.c_void_p))
+        res = lib.bpf_delete_elem(self.map_fd, ct.byref(key))
         if res < 0:
             raise Exception("Could not delete item")
 
@@ -494,8 +495,7 @@ class PerfEventArray(ArrayBase):
             return
         # Delete entry from the array
         c_key = self._normalize_key(key)
-        key_p = ct.pointer(c_key)
-        lib.bpf_delete_elem(self.map_fd, ct.cast(key_p, ct.c_void_p))
+        lib.bpf_delete_elem(self.map_fd, ct.byref(c_key))
         key_id = (id(self), key)
         if key_id in self.bpf.open_kprobes:
             # The key is opened for perf ring buffer
@@ -532,7 +532,7 @@ class PerfEventArray(ArrayBase):
                     exit()
                 else:
                     raise e
-        def lost_cb_(lost):
+        def lost_cb_(_, lost):
             try:
                 lost_cb(lost)
             except IOError as e:
@@ -729,8 +729,7 @@ class StackTrace(TableBase):
         return i
 
     def __delitem__(self, key):
-        key_p = ct.pointer(key)
-        res = lib.bpf_delete_elem(self.map_fd, ct.cast(key_p, ct.c_void_p))
+        res = lib.bpf_delete_elem(self.map_fd, ct.byref(key))
         if res < 0:
             raise KeyError
 

@@ -41,18 +41,16 @@ int bpf_open_raw_sock(const char *name);
 
 typedef void (*perf_reader_cb)(void *cb_cookie, int pid, uint64_t callchain_num, void *callchain);
 typedef void (*perf_reader_raw_cb)(void *cb_cookie, void *raw, int raw_size);
-typedef void (*perf_reader_lost_cb)(uint64_t lost);
+typedef void (*perf_reader_lost_cb)(void *cb_cookie, uint64_t lost);
 
-void * bpf_attach_kprobe(int progfd, int attach_type, const char *ev_name,
-                        const char *fn_name,
-                        int pid, int cpu, int group_fd,
-                        perf_reader_cb cb, void *cb_cookie);
+void *bpf_attach_kprobe(int progfd, int attach_type, const char *ev_name,
+                        const char *fn_name, perf_reader_cb cb,
+                        void *cb_cookie);
 
 int bpf_detach_kprobe(const char *ev_name);
 
-void * bpf_attach_uprobe(int progfd, int attach_type, const char *ev_name,
-                        const char *binary_path, uint64_t offset,
-                        int pid, int cpu, int group_fd,
+void *bpf_attach_uprobe(int progfd, int attach_type, const char *ev_name,
+                        const char *binary_path, uint64_t offset, int pid,
                         perf_reader_cb cb, void *cb_cookie);
 
 int bpf_detach_uprobe(const char *ev_name);

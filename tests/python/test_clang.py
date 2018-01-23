@@ -7,6 +7,8 @@ import ctypes as ct
 from unittest import main, skipUnless, TestCase
 import os
 import sys
+import socket
+import struct
 from contextlib import contextmanager
 import distutils.version
 
@@ -439,7 +441,7 @@ int process(struct xdp_md *ctx) {
         """
         b = BPF(text=text)
         t = b["jmp"]
-        self.assertEquals(len(t), 32);
+        self.assertEqual(len(t), 32);
 
     def test_update_macro_arg(self):
         text = """
@@ -459,7 +461,7 @@ int process(struct xdp_md *ctx) {
         """
         b = BPF(text=text)
         t = b["act"]
-        self.assertEquals(len(t), 32);
+        self.assertEqual(len(t), 32);
 
     def test_ext_ptr_maps(self):
         bpf_text = """
@@ -653,6 +655,48 @@ struct a {
 BPF_HASH(drops, struct a);
         """
         b = BPF(text=text)
+
+    def test_int128_types(self):
+        text = """
+BPF_HASH(table1, unsigned __int128, __int128);
+"""
+        b = BPF(text=text)
+        table = b['table1']
+        self.assertEqual(ct.sizeof(table.Key), 16)
+        self.assertEqual(ct.sizeof(table.Leaf), 16)
+        table[
+            table.Key.from_buffer_copy(
+                socket.inet_pton(socket.AF_INET6, "2001:db8::"))
+        ] = table.Leaf.from_buffer_copy(struct.pack('LL', 42, 123456789))
+        for k, v in table.items():
+            self.assertEqual(v[0], 42)
+            self.assertEqual(v[1], 123456789)
+            self.assertEqual(socket.inet_ntop(socket.AF_INET6,
+                                              struct.pack('LL', k[0], k[1])),
+                             "2001:db8::")
+
+    def test_padding_types(self):
+        text = """
+struct key_t {
+  u32 f1_1;               /* offset 0 */
+  struct {
+    char f2_1;            /* offset 16 */
+    __int128 f2_2;        /* offset 32 */
+  };
+  u8 f1_3;                /* offset 48 */
+  unsigned __int128 f1_4; /* offset 64 */
+  char f1_5;              /* offset 80 */
+};
+struct value_t {
+  u8 src[4] __attribute__ ((aligned (8))); /* offset 0 */
+  u8 dst[4] __attribute__ ((aligned (8))); /* offset 8 */
+};
+BPF_HASH(table1, struct key_t, struct value_t);
+"""
+        b = BPF(text=text)
+        table = b['table1']
+        self.assertEqual(ct.sizeof(table.Key), 96)
+        self.assertEqual(ct.sizeof(table.Leaf), 16)
 
 
 if __name__ == "__main__":

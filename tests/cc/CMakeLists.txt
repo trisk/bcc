@@ -16,8 +16,10 @@ add_executable(test_libbcc
 	test_array_table.cc
 	test_bpf_table.cc
 	test_hash_table.cc
+	test_perf_event.cc
 	test_usdt_args.cc
-	test_usdt_probes.cc)
+	test_usdt_probes.cc
+	utils.cc)
 
 target_link_libraries(test_libbcc bcc-shared dl)
 add_test(NAME test_libbcc COMMAND ${TEST_WRAPPER} c_test_all sudo ${CMAKE_CURRENT_BINARY_DIR}/test_libbcc)

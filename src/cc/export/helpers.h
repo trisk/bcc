@@ -96,6 +96,7 @@ struct _name##_table_t { \
   u32 leaf; \
   /* counter = map.perf_read(index) */ \
   u64 (*perf_read) (int); \
+  int (*perf_counter_value) (int, void *, u32); \
   u32 max_entries; \
 }; \
 __attribute__((section("maps/perf_array"))) \
@@ -245,6 +246,10 @@ static int (*bpf_perf_event_output)(void *ctx, void *map, u64 index, void *data,
   (void *) BPF_FUNC_perf_event_output;
 static int (*bpf_skb_load_bytes)(void *ctx, int offset, void *to, u32 len) =
   (void *) BPF_FUNC_skb_load_bytes;
+static int (*bpf_perf_event_read_value)(void *map, u64 flags, void *buf, u32 buf_size) =
+  (void *) BPF_FUNC_perf_event_read_value;
+static int (*bpf_perf_prog_read_value)(void *ctx, void *buf, u32 buf_size) =
+  (void *) BPF_FUNC_perf_prog_read_value;
 
 /* bcc_get_stackid will return a negative value in the case of an error
  *
@@ -294,6 +299,8 @@ static int (*bpf_skb_change_head)(void *ctx, u32 len, u64 flags) =
   (void *) BPF_FUNC_skb_change_head;
 static int (*bpf_xdp_adjust_head)(void *ctx, int offset) =
   (void *) BPF_FUNC_xdp_adjust_head;
+static int (*bpf_override_return)(void *pt_regs, unsigned long rc) =
+  (void *) BPF_FUNC_override_return;
 
 /* llvm builtin functions that eBPF C program may use to
  * emit BPF_LD_ABS and BPF_LD_IND instructions
@@ -593,14 +600,14 @@ int tracepoint__##category##__##event(struct tracepoint__##category##__##event *
 
 #define TP_DATA_LOC_READ_CONST(dst, field, length)                        \
         do {                                                              \
-            short __offset = args->data_loc_##field & 0xFFFF;             \
+            unsigned short __offset = args->data_loc_##field & 0xFFFF;    \
             bpf_probe_read((void *)dst, length, (char *)args + __offset); \
         } while (0);
 
 #define TP_DATA_LOC_READ(dst, field)                                        \
         do {                                                                \
-            short __offset = args->data_loc_##field & 0xFFFF;               \
-            short __length = args->data_loc_##field >> 16;                  \
+            unsigned short __offset = args->data_loc_##field & 0xFFFF;      \
+            unsigned short __length = args->data_loc_##field >> 16;         \
             bpf_probe_read((void *)dst, __length, (char *)args + __offset); \
         } while (0);
 

@@ -20,6 +20,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <linux/bpf.h>
 #include <linux/bpf_common.h>
@@ -47,6 +48,9 @@
 #include "libbpf.h"
 #include "perf_reader.h"
 
+// TODO: Remove this when CentOS 6 support is not needed anymore
+#include "setns.h"
+
 // TODO: remove these defines when linux-libc-dev exports them properly
 
 #ifndef __NR_bpf
@@ -71,6 +75,11 @@
 
 #ifndef PERF_FLAG_FD_CLOEXEC
 #define PERF_FLAG_FD_CLOEXEC (1UL << 3)
+#endif
+
+// TODO: Remove this when CentOS 6 support is not needed anymore
+#ifndef AF_ALG
+#define AF_ALG 38
 #endif
 
 #define min(x, y) ((x) < (y) ? (x) : (y))
@@ -448,7 +457,8 @@ int bpf_prog_load(enum bpf_prog_type prog_type, const char *name,
     if (tmp_log_buf)
       free(tmp_log_buf);
     tmp_log_buf_size = LOG_BUF_SIZE;
-    attr.log_level = 1;
+    if (attr.log_level == 0)
+      attr.log_level = 1;
     for (;;) {
       tmp_log_buf = malloc(tmp_log_buf_size);
       if (!tmp_log_buf) {
@@ -472,10 +482,12 @@ int bpf_prog_load(enum bpf_prog_type prog_type, const char *name,
     }
   }
 
-  // If log_level is not 0, either speficied by user or set due to error,
-  // print the log message.
+  // Check if we should print the log message if log_level is not 0,
+  // either specified by user or set due to error.
   if (attr.log_level > 0) {
-    if (log_buf)
+    // Don't print if user enabled logging and provided log buffer,
+    // but there is no error.
+    if (log_buf && ret < 0)
       bpf_print_hints(ret, log_buf);
     else if (tmp_log_buf)
       bpf_print_hints(ret, tmp_log_buf);
@@ -497,6 +509,10 @@ int bpf_open_raw_sock(const char *name)
     fprintf(stderr, "cannot create raw socket\n");
     return -1;
   }
+
+  /* Do not bind on empty interface names */
+  if (!name || *name == '\0')
+    return sock;
 
   memset(&sll, 0, sizeof(sll));
   sll.sll_family = AF_PACKET;
@@ -520,37 +536,154 @@ int bpf_attach_socket(int sock, int prog) {
   return setsockopt(sock, SOL_SOCKET, SO_ATTACH_BPF, &prog, sizeof(prog));
 }
 
-static int bpf_attach_tracing_event(int progfd, const char *event_path,
-    struct perf_reader *reader, int pid, int cpu, int group_fd) {
-  int efd, pfd;
-  ssize_t bytes;
-  char buf[256];
+#define PMU_TYPE_FILE "/sys/bus/event_source/devices/%s/type"
+static int bpf_find_probe_type(const char *event_type)
+{
+  int fd;
+  int ret;
+  char buf[PATH_MAX];
+
+  ret = snprintf(buf, sizeof(buf), PMU_TYPE_FILE, event_type);
+  if (ret < 0 || ret >= sizeof(buf))
+    return -1;
+
+  fd = open(buf, O_RDONLY);
+  if (fd < 0)
+    return -1;
+  ret = read(fd, buf, sizeof(buf));
+  close(fd);
+  if (ret < 0 || ret >= sizeof(buf))
+    return -1;
+  errno = 0;
+  ret = (int)strtol(buf, NULL, 10);
+  return errno ? -1 : ret;
+}
+
+#define PMU_RETPROBE_FILE "/sys/bus/event_source/devices/%s/format/retprobe"
+static int bpf_get_retprobe_bit(const char *event_type)
+{
+  int fd;
+  int ret;
+  char buf[PATH_MAX];
+
+  ret = snprintf(buf, sizeof(buf), PMU_RETPROBE_FILE, event_type);
+  if (ret < 0 || ret >= sizeof(buf))
+    return -1;
+
+  fd = open(buf, O_RDONLY);
+  if (fd < 0)
+    return -1;
+  ret = read(fd, buf, sizeof(buf));
+  close(fd);
+  if (ret < 0 || ret >= sizeof(buf))
+    return -1;
+  if (strlen(buf) < strlen("config:"))
+    return -1;
+  errno = 0;
+  ret = (int)strtol(buf + strlen("config:"), NULL, 10);
+  return errno ? -1 : ret;
+}
+
+/*
+ * new kernel API allows creating [k,u]probe with perf_event_open, which
+ * makes it easier to clean up the [k,u]probe. This function tries to
+ * create pfd with the new API.
+ */
+static int bpf_try_perf_event_open_with_probe(const char *name, uint64_t offs,
+             int pid, char *event_type, int is_return)
+{
   struct perf_event_attr attr = {};
+  int type = bpf_find_probe_type(event_type);
+  int is_return_bit = bpf_get_retprobe_bit(event_type);
+  int cpu = 0;
 
-  snprintf(buf, sizeof(buf), "%s/id", event_path);
-  efd = open(buf, O_RDONLY, 0);
-  if (efd < 0) {
-    fprintf(stderr, "open(%s): %s\n", buf, strerror(errno));
+  if (type < 0 || is_return_bit < 0)
     return -1;
-  }
-
-  bytes = read(efd, buf, sizeof(buf));
-  if (bytes <= 0 || bytes >= sizeof(buf)) {
-    fprintf(stderr, "read(%s): %s\n", buf, strerror(errno));
-    close(efd);
-    return -1;
-  }
-  close(efd);
-  buf[bytes] = '\0';
-  attr.config = strtol(buf, NULL, 0);
-  attr.type = PERF_TYPE_TRACEPOINT;
   attr.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_CALLCHAIN;
   attr.sample_period = 1;
   attr.wakeup_events = 1;
-  pfd = syscall(__NR_perf_event_open, &attr, pid, cpu, group_fd, PERF_FLAG_FD_CLOEXEC);
+  if (is_return)
+    attr.config |= 1 << is_return_bit;
+
+  /*
+   * struct perf_event_attr in latest perf_event.h has the following
+   * extension to config1 and config2. To keep bcc compatibe with
+   * older perf_event.h, we use config1 and config2 here instead of
+   * kprobe_func, uprobe_path, kprobe_addr, and probe_offset.
+   *
+   * union {
+   *  __u64 bp_addr;
+   *  __u64 kprobe_func;
+   *  __u64 uprobe_path;
+   *  __u64 config1;
+   * };
+   * union {
+   *   __u64 bp_len;
+   *   __u64 kprobe_addr;
+   *   __u64 probe_offset;
+   *   __u64 config2;
+   * };
+   */
+  attr.config2 = offs;  /* config2 here is kprobe_addr or probe_offset */
+  attr.size = sizeof(attr);
+  attr.type = type;
+  /* config1 here is kprobe_func or  uprobe_path */
+  attr.config1 = ptr_to_u64((void *)name);
+  // PID filter is only possible for uprobe events.
+  if (pid < 0)
+    pid = -1;
+  // perf_event_open API doesn't allow both pid and cpu to be -1.
+  // So only set it to -1 when PID is not -1.
+  // Tracing events do not do CPU filtering in any cases.
+  if (pid != -1)
+    cpu = -1;
+  return syscall(__NR_perf_event_open, &attr, pid, cpu, -1 /* group_fd */,
+                 PERF_FLAG_FD_CLOEXEC);
+}
+
+static int bpf_attach_tracing_event(int progfd, const char *event_path,
+                                    struct perf_reader *reader, int pid,
+                                    int pfd)
+{
+  int efd, cpu = 0;
+  ssize_t bytes;
+  char buf[PATH_MAX];
+  struct perf_event_attr attr = {};
+
   if (pfd < 0) {
-    fprintf(stderr, "perf_event_open(%s/id): %s\n", event_path, strerror(errno));
-    return -1;
+    snprintf(buf, sizeof(buf), "%s/id", event_path);
+    efd = open(buf, O_RDONLY, 0);
+    if (efd < 0) {
+      fprintf(stderr, "open(%s): %s\n", buf, strerror(errno));
+      return -1;
+    }
+
+    bytes = read(efd, buf, sizeof(buf));
+    if (bytes <= 0 || bytes >= sizeof(buf)) {
+      fprintf(stderr, "read(%s): %s\n", buf, strerror(errno));
+      close(efd);
+      return -1;
+    }
+    close(efd);
+    buf[bytes] = '\0';
+    attr.config = strtol(buf, NULL, 0);
+    attr.type = PERF_TYPE_TRACEPOINT;
+    attr.sample_type = PERF_SAMPLE_RAW | PERF_SAMPLE_CALLCHAIN;
+    attr.sample_period = 1;
+    attr.wakeup_events = 1;
+    // PID filter is only possible for uprobe events.
+    if (pid < 0)
+      pid = -1;
+    // perf_event_open API doesn't allow both pid and cpu to be -1.
+    // So only set it to -1 when PID is not -1.
+    // Tracing events do not do CPU filtering in any cases.
+    if (pid != -1)
+      cpu = -1;
+    pfd = syscall(__NR_perf_event_open, &attr, pid, cpu, -1 /* group_fd */, PERF_FLAG_FD_CLOEXEC);
+    if (pfd < 0) {
+      fprintf(stderr, "perf_event_open(%s/id): %s\n", event_path, strerror(errno));
+      return -1;
+    }
   }
   perf_reader_set_fd(reader, pfd);
 
@@ -569,12 +702,12 @@ static int bpf_attach_tracing_event(int progfd, const char *event_path,
   return 0;
 }
 
-void * bpf_attach_kprobe(int progfd, enum bpf_probe_attach_type attach_type, const char *ev_name,
-                        const char *fn_name,
-                        pid_t pid, int cpu, int group_fd,
+void *bpf_attach_kprobe(int progfd, enum bpf_probe_attach_type attach_type,
+                        const char *ev_name, const char *fn_name,
                         perf_reader_cb cb, void *cb_cookie)
 {
   int kfd;
+  int pfd;
   char buf[256];
   char event_alias[128];
   struct perf_reader *reader = NULL;
@@ -584,26 +717,30 @@ void * bpf_attach_kprobe(int progfd, enum bpf_probe_attach_type attach_type, con
   if (!reader)
     goto error;
 
-  snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/%s_events", event_type);
-  kfd = open(buf, O_WRONLY | O_APPEND, 0);
-  if (kfd < 0) {
-    fprintf(stderr, "open(%s): %s\n", buf, strerror(errno));
-    goto error;
-  }
+  pfd = bpf_try_perf_event_open_with_probe(fn_name, 0, -1, event_type,
+                                           attach_type != BPF_PROBE_ENTRY);
 
-  snprintf(event_alias, sizeof(event_alias), "%s_bcc_%d", ev_name, getpid());
-  snprintf(buf, sizeof(buf), "%c:%ss/%s %s", attach_type==BPF_PROBE_ENTRY ? 'p' : 'r',
-			event_type, event_alias, fn_name);
-  if (write(kfd, buf, strlen(buf)) < 0) {
-    if (errno == EINVAL)
-      fprintf(stderr, "check dmesg output for possible cause\n");
+  if (pfd < 0) {
+    snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/%s_events", event_type);
+    kfd = open(buf, O_WRONLY | O_APPEND, 0);
+    if (kfd < 0) {
+      fprintf(stderr, "open(%s): %s\n", buf, strerror(errno));
+      goto error;
+    }
+
+    snprintf(event_alias, sizeof(event_alias), "%s_bcc_%d", ev_name, getpid());
+    snprintf(buf, sizeof(buf), "%c:%ss/%s %s", attach_type==BPF_PROBE_ENTRY ? 'p' : 'r',
+             event_type, event_alias, fn_name);
+    if (write(kfd, buf, strlen(buf)) < 0) {
+      if (errno == EINVAL)
+        fprintf(stderr, "check dmesg output for possible cause\n");
+      close(kfd);
+      goto error;
+    }
     close(kfd);
-    goto error;
+    snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/events/%ss/%s", event_type, event_alias);
   }
-  close(kfd);
-
-  snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/events/%ss/%s", event_type, event_alias);
-  if (bpf_attach_tracing_event(progfd, buf, reader, pid, cpu, group_fd) < 0)
+  if (bpf_attach_tracing_event(progfd, buf, reader, -1 /* PID */, pfd) < 0)
     goto error;
 
   return reader;
@@ -675,52 +812,57 @@ static void exit_mount_ns(int fd) {
     perror("setns");
 }
 
-void * bpf_attach_uprobe(int progfd, enum bpf_probe_attach_type attach_type, const char *ev_name,
-                        const char *binary_path, uint64_t offset,
-                        pid_t pid, int cpu, int group_fd,
-                        perf_reader_cb cb, void *cb_cookie)
+void *bpf_attach_uprobe(int progfd, enum bpf_probe_attach_type attach_type,
+                        const char *ev_name, const char *binary_path,
+                        uint64_t offset, pid_t pid, perf_reader_cb cb,
+                        void *cb_cookie)
 {
   char buf[PATH_MAX];
   char event_alias[PATH_MAX];
   struct perf_reader *reader = NULL;
   static char *event_type = "uprobe";
   int res, kfd = -1, ns_fd = -1;
+  int pfd;
 
   reader = perf_reader_new(cb, NULL, NULL, cb_cookie, probe_perf_reader_page_cnt);
   if (!reader)
     goto error;
 
-  snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/%s_events", event_type);
-  kfd = open(buf, O_WRONLY | O_APPEND, 0);
-  if (kfd < 0) {
-    fprintf(stderr, "open(%s): %s\n", buf, strerror(errno));
-    goto error;
-  }
+  pfd = bpf_try_perf_event_open_with_probe(binary_path, offset, pid, event_type,
+                                           attach_type != BPF_PROBE_ENTRY);
+  if (pfd < 0) {
+    snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/%s_events", event_type);
+    kfd = open(buf, O_WRONLY | O_APPEND, 0);
+    if (kfd < 0) {
+      fprintf(stderr, "open(%s): %s\n", buf, strerror(errno));
+      goto error;
+    }
 
-  res = snprintf(event_alias, sizeof(event_alias), "%s_bcc_%d", ev_name, getpid());
-  if (res < 0 || res >= sizeof(event_alias)) {
-    fprintf(stderr, "Event name (%s) is too long for buffer\n", ev_name);
-    goto error;
-  }
-  res = snprintf(buf, sizeof(buf), "%c:%ss/%s %s:0x%lx", attach_type==BPF_PROBE_ENTRY ? 'p' : 'r',
-			event_type, event_alias, binary_path, offset);
-  if (res < 0 || res >= sizeof(buf)) {
-    fprintf(stderr, "Event alias (%s) too long for buffer\n", event_alias);
-    goto error;
-  }
+    res = snprintf(event_alias, sizeof(event_alias), "%s_bcc_%d", ev_name, getpid());
+    if (res < 0 || res >= sizeof(event_alias)) {
+      fprintf(stderr, "Event name (%s) is too long for buffer\n", ev_name);
+      goto error;
+    }
+    res = snprintf(buf, sizeof(buf), "%c:%ss/%s %s:0x%lx", attach_type==BPF_PROBE_ENTRY ? 'p' : 'r',
+                   event_type, event_alias, binary_path, offset);
+    if (res < 0 || res >= sizeof(buf)) {
+      fprintf(stderr, "Event alias (%s) too long for buffer\n", event_alias);
+      goto error;
+    }
 
-  ns_fd = enter_mount_ns(pid);
-  if (write(kfd, buf, strlen(buf)) < 0) {
-    if (errno == EINVAL)
-      fprintf(stderr, "check dmesg output for possible cause\n");
-    goto error;
-  }
-  close(kfd);
-  exit_mount_ns(ns_fd);
-  ns_fd = -1;
+    ns_fd = enter_mount_ns(pid);
+    if (write(kfd, buf, strlen(buf)) < 0) {
+      if (errno == EINVAL)
+        fprintf(stderr, "check dmesg output for possible cause\n");
+      goto error;
+    }
+    close(kfd);
+    exit_mount_ns(ns_fd);
+    ns_fd = -1;
 
-  snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/events/%ss/%s", event_type, event_alias);
-  if (bpf_attach_tracing_event(progfd, buf, reader, pid, cpu, group_fd) < 0)
+    snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/events/%ss/%s", event_type, event_alias);
+  }
+  if (bpf_attach_tracing_event(progfd, buf, reader, pid, pfd) < 0)
     goto error;
 
   return reader;
@@ -735,8 +877,43 @@ error:
 
 static int bpf_detach_probe(const char *ev_name, const char *event_type)
 {
-  int kfd, res;
+  int kfd = -1, res;
   char buf[PATH_MAX];
+  int found_event = 0;
+  size_t bufsize = 0;
+  char *cptr = NULL;
+  FILE *fp;
+
+  /*
+   * For [k,u]probe created with perf_event_open (on newer kernel), it is
+   * not necessary to clean it up in [k,u]probe_events. We first look up
+   * the %s_bcc_%d line in [k,u]probe_events. If the event is not found,
+   * it is safe to skip the cleaning up process (write -:... to the file).
+   */
+  snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/%s_events", event_type);
+  fp = fopen(buf, "r");
+  if (!fp) {
+    fprintf(stderr, "open(%s): %s\n", buf, strerror(errno));
+    goto error;
+  }
+
+  res = snprintf(buf, sizeof(buf), "%ss/%s_bcc_%d", event_type, ev_name, getpid());
+  if (res < 0 || res >= sizeof(buf)) {
+    fprintf(stderr, "snprintf(%s): %d\n", ev_name, res);
+    goto error;
+  }
+
+  while (getline(&cptr, &bufsize, fp) != -1)
+    if (strstr(cptr, buf) != NULL) {
+      found_event = 1;
+      break;
+    }
+  fclose(fp);
+  fp = NULL;
+
+  if (!found_event)
+    return 0;
+
   snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/%s_events", event_type);
   kfd = open(buf, O_WRONLY | O_APPEND, 0);
   if (kfd < 0) {
@@ -760,6 +937,8 @@ static int bpf_detach_probe(const char *ev_name, const char *event_type)
 error:
   if (kfd >= 0)
     close(kfd);
+  if (fp)
+    fclose(fp);
   return -1;
 }
 
@@ -774,9 +953,9 @@ int bpf_detach_uprobe(const char *ev_name)
 }
 
 
-void * bpf_attach_tracepoint(int progfd, const char *tp_category,
-                             const char *tp_name, int pid, int cpu,
-                             int group_fd, perf_reader_cb cb, void *cb_cookie) {
+void *bpf_attach_tracepoint(int progfd, const char *tp_category,
+                            const char *tp_name, perf_reader_cb cb,
+                            void *cb_cookie) {
   char buf[256];
   struct perf_reader *reader = NULL;
 
@@ -786,7 +965,7 @@ void * bpf_attach_tracepoint(int progfd, const char *tp_category,
 
   snprintf(buf, sizeof(buf), "/sys/kernel/debug/tracing/events/%s/%s",
            tp_category, tp_name);
-  if (bpf_attach_tracing_event(progfd, buf, reader, pid, cpu, group_fd) < 0)
+  if (bpf_attach_tracing_event(progfd, buf, reader, -1 /* PID */, -1 /* pfd */) < 0)
     goto error;
 
   return reader;
@@ -845,27 +1024,48 @@ error:
 
 static int invalid_perf_config(uint32_t type, uint64_t config) {
   switch (type) {
-    case PERF_TYPE_HARDWARE:
-      return config >= PERF_COUNT_HW_MAX;
-    case PERF_TYPE_SOFTWARE:
-      return config >= PERF_COUNT_SW_MAX;
-    case PERF_TYPE_RAW:
-      return 0;
-    default:
-      return 1;
+  case PERF_TYPE_HARDWARE:
+    if (config >= PERF_COUNT_HW_MAX) {
+      fprintf(stderr, "HARDWARE perf event config out of range\n");
+      goto is_invalid;
+    }
+    return 0;
+  case PERF_TYPE_SOFTWARE:
+    if (config >= PERF_COUNT_SW_MAX) {
+      fprintf(stderr, "SOFTWARE perf event config out of range\n");
+      goto is_invalid;
+    } else if (config == 10 /* PERF_COUNT_SW_BPF_OUTPUT */) {
+      fprintf(stderr, "Unable to open or attach perf event for BPF_OUTPUT\n");
+      goto is_invalid;
+    }
+    return 0;
+  case PERF_TYPE_HW_CACHE:
+    if (((config >> 16) >= PERF_COUNT_HW_CACHE_RESULT_MAX) ||
+        (((config >> 8) & 0xff) >= PERF_COUNT_HW_CACHE_OP_MAX) ||
+        ((config & 0xff) >= PERF_COUNT_HW_CACHE_MAX)) {
+      fprintf(stderr, "HW_CACHE perf event config out of range\n");
+      goto is_invalid;
+    }
+    return 0;
+  case PERF_TYPE_TRACEPOINT:
+  case PERF_TYPE_BREAKPOINT:
+    fprintf(stderr,
+            "Unable to open or attach TRACEPOINT or BREAKPOINT events\n");
+    goto is_invalid;
+  default:
+    return 0;
   }
+is_invalid:
+  fprintf(stderr, "Invalid perf event type %" PRIu32 " config %" PRIu64 "\n",
+          type, config);
+  return 1;
 }
 
 int bpf_open_perf_event(uint32_t type, uint64_t config, int pid, int cpu) {
   int fd;
   struct perf_event_attr attr = {};
 
-  if (type != PERF_TYPE_HARDWARE && type != PERF_TYPE_RAW) {
-    fprintf(stderr, "Unsupported perf event type\n");
-    return -1;
-  }
   if (invalid_perf_config(type, config)) {
-    fprintf(stderr, "Invalid perf event config\n");
     return -1;
   }
 
@@ -1012,12 +1212,7 @@ cleanup:
 int bpf_attach_perf_event(int progfd, uint32_t ev_type, uint32_t ev_config,
                           uint64_t sample_period, uint64_t sample_freq,
                           pid_t pid, int cpu, int group_fd) {
-  if (ev_type != PERF_TYPE_HARDWARE && ev_type != PERF_TYPE_SOFTWARE) {
-    fprintf(stderr, "Unsupported perf event type\n");
-    return -1;
-  }
   if (invalid_perf_config(ev_type, ev_config)) {
-    fprintf(stderr, "Invalid perf event config\n");
     return -1;
   }
   if (!((sample_period > 0) ^ (sample_freq > 0))) {
@@ -1030,7 +1225,8 @@ int bpf_attach_perf_event(int progfd, uint32_t ev_type, uint32_t ev_config,
   struct perf_event_attr attr = {};
   attr.type = ev_type;
   attr.config = ev_config;
-  attr.inherit = 1;
+  if (pid > 0)
+    attr.inherit = 1;
   if (sample_freq > 0) {
     attr.freq = 1;
     attr.sample_freq = sample_freq;
